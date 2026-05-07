@@ -1,0 +1,45 @@
+# Sample recipe demonstrating the four sections that share this file:
+#
+#   [meta]            peipkg-build owns: shared facts + build script
+#   [[package]]       peipkg-build owns: one stanza per output .peipkg
+#   [upstream]        peipkg-manager owns: where source lives, how to recognise versions
+#   [watch]           peipkg-manager owns: how the manager learns about new versions
+
+[meta]
+license = "Zlib"
+homepage = "https://zlib.net"
+build_script = "build.sh"
+
+[[package]]
+name = "libz"
+architecture = "x86_64"
+description = "zlib compression library — runtime"
+dependencies = [{ name = "libc" }]
+side_effects = ["ldconfig"]
+files = [
+  "usr/lib/x86_64-linux-peios/libz.so.1",
+  "usr/lib/x86_64-linux-peios/libz.so.1.*",
+]
+
+[[package]]
+name = "libz-dev"
+architecture = "x86_64"
+dependencies = [
+  { name = "libz", same_build = true },
+  { name = "libc-dev" },
+]
+files = [
+  "usr/include/**",
+  "usr/lib/x86_64-linux-peios/libz.so",
+  "usr/lib/x86_64-linux-peios/libz.a",
+  "usr/lib/x86_64-linux-peios/pkgconfig/**",
+]
+
+[upstream]
+git = "https://github.com/madler/zlib"
+tag_pattern = "^v(\\d+\\.\\d+\\.\\d+)$"
+peios_revision = 1
+
+[watch]
+github_webhook = true
+poll_interval = "1h"

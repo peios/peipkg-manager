@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # The end-to-end manager test requires peipkg-build and peipkg-repo
+      # binaries on PATH. Pull the latest releases of the sibling repos.
+      # Tests skip cleanly if the downloads fail, but a successful pull
+      # gives meaningful coverage.
+      - name: Install peipkg-build + peipkg-repo
+        run: |
+          set -euo pipefail
+          mkdir -p $HOME/bin
+          curl -sSL -o $HOME/bin/peipkg-build \
+            https://github.com/peios/peipkg-build/releases/download/latest/peipkg-build-linux-amd64 \
+            || true
+          curl -sSL -o $HOME/bin/peipkg-repo \
+            https://github.com/peios/peipkg-repo/releases/download/latest/peipkg-repo-linux-amd64 \
+            || true
+          chmod +x $HOME/bin/peipkg-build $HOME/bin/peipkg-repo 2>/dev/null || true
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: go test
+        run: go test -count=1 -race ./...
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build static linux/amd64 binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w" \
+            -o peipkg-manager-linux-amd64 ./cmd/peipkg-manager
+
+      - name: Build static linux/arm64 binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+            go build -trimpath -ldflags="-s -w" \
+            -o peipkg-manager-linux-arm64 ./cmd/peipkg-manager
+
+      - name: Update latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes 2>/dev/null || true
+          git tag -f latest
+          git push -f origin latest
+          gh release create latest \
+            peipkg-manager-linux-amd64 peipkg-manager-linux-arm64 \
+            --title "Latest Build" \
+            --notes "Built from $(git rev-parse --short HEAD) on $(date -u +%Y-%m-%d)"

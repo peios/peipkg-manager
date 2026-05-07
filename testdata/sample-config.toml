@@ -1,0 +1,45 @@
+# peipkg-config.toml — sample.
+#
+# Copy to /etc/peipkg-manager/config.toml on the build farm host and
+# adjust paths and credentials. Used by `peipkg-manager --config`.
+
+[manager]
+# farm_id recorded in every package's manifest.build.farm_id (PSD-009 §3.3.4).
+id = "peios-build-1"
+
+# Directory containing one subdirectory per package (each with its own
+# peipkg.toml + build.sh). Subdirectories without a peipkg.toml are
+# silently ignored, so it's safe to keep notes/scratch dirs alongside.
+recipes_dir = "/etc/peipkg-manager/recipes"
+
+# State directory. peipkg-manager creates and owns:
+#   sources/  ephemeral per-build source clones
+#   stage/    ephemeral per-build output dirs
+#   publish/  outputs awaiting peipkg-repo publish
+#   repo/     the published repository state (peipkg-repo's domain)
+state_dir = "/var/lib/peipkg-manager"
+
+[repo]
+# Recorded in repo.json's repo.name. Used at first-run init only.
+name = "peios-official"
+description = "Official Peios package repository"
+
+[signing]
+# Ed25519 private key (PEM PKCS#8 or 32-byte raw seed). Signs every
+# package and every published index/descriptor. Protect appropriately;
+# compromise = re-key the entire repository.
+key_file = "/etc/peipkg-manager/farm.ed25519"
+
+[upload]
+# rclone | none
+backend = "rclone"
+remote = "r2:pkgs.peios.org"
+
+[http]
+# Empty addr disables the HTTP server (polling only).
+addr = ":8080"
+webhook_secret_file = "/etc/peipkg-manager/webhook-secret"
+
+[poll]
+# Default polling interval. Recipes may override via [watch].poll_interval.
+default_interval = "1h"
