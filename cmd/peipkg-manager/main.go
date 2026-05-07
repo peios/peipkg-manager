@@ -57,6 +57,26 @@ func main() {
 		runFn = mgr.RunOnce
 	}
 
+	// SIGHUP triggers a recipe-roster reload without restarting the
+	// process. Only meaningful for daemon mode — in --once mode the
+	// process exits before the signal could ever fire.
+	if !*once {
+		hupCh := make(chan os.Signal, 1)
+		signal.Notify(hupCh, syscall.SIGHUP)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					signal.Stop(hupCh)
+					return
+				case <-hupCh:
+					logger.Info("received SIGHUP; reloading recipes")
+					mgr.Reload()
+				}
+			}
+		}()
+	}
+
 	logger.Info("peipkg-manager starting", "config", *configPath, "farm_id", cfg.Manager.ID, "mode", mode)
 	if err := runFn(ctx); err != nil && err != context.Canceled {
 		logger.Error("manager exited with error", "err", err)

@@ -233,6 +233,110 @@ func TestAlreadyPublishedReadsArchive(t *testing.T) {
 	}
 }
 
+func TestReloadCoalesces(t *testing.T) {
+	mgr := &Manager{reloadCh: make(chan struct{}, 1)}
+
+	// Two consecutive Reloads with no consumer in between should
+	// coalesce: only one signal pending.
+	mgr.Reload()
+	mgr.Reload()
+
+	select {
+	case <-mgr.reloadCh:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected one reload signal pending after Reload()")
+	}
+	select {
+	case <-mgr.reloadCh:
+		t.Fatal("second Reload should have been dropped (channel coalesces)")
+	default:
+	}
+}
+
+func TestReloadIsNoOpBeforeRun(t *testing.T) {
+	// A Manager constructed with reloadCh nil (e.g., in a test stub)
+	// must not panic when Reload is called.
+	mgr := &Manager{}
+	mgr.Reload() // should not panic
+}
+
+func TestLoadRecipesPicksUpAddedRecipe(t *testing.T) {
+	dir := t.TempDir()
+
+	// Initial state: one recipe.
+	mustMkRecipe(t, filepath.Join(dir, "alpha"))
+
+	mgr := &Manager{
+		cfg:    config.Config{Manager: config.Manager{RecipesDir: dir}},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if err := mgr.loadRecipes(); err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+	if len(mgr.recipes) != 1 || mgr.recipes[0].ID != "alpha" {
+		t.Fatalf("after first load: recipes = %v", mgr.recipes)
+	}
+
+	// Add a second recipe and reload.
+	mustMkRecipe(t, filepath.Join(dir, "beta"))
+	if err := mgr.loadRecipes(); err != nil {
+		t.Fatalf("second load: %v", err)
+	}
+	if len(mgr.recipes) != 2 {
+		t.Fatalf("after second load: expected 2 recipes, got %d (%v)", len(mgr.recipes), mgr.recipes)
+	}
+	got := []string{mgr.recipes[0].ID, mgr.recipes[1].ID}
+	if got[0] != "alpha" || got[1] != "beta" {
+		t.Errorf("expected sorted [alpha beta], got %v", got)
+	}
+
+	// Remove one and reload.
+	if err := os.RemoveAll(filepath.Join(dir, "alpha")); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.loadRecipes(); err != nil {
+		t.Fatalf("third load: %v", err)
+	}
+	if len(mgr.recipes) != 1 || mgr.recipes[0].ID != "beta" {
+		t.Errorf("after removal: recipes = %v, want [beta]", mgr.recipes)
+	}
+}
+
+func TestLoadRecipesReturnsErrorOnMissingDir(t *testing.T) {
+	mgr := &Manager{
+		cfg:    config.Config{Manager: config.Manager{RecipesDir: "/nonexistent/recipes"}},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if err := mgr.loadRecipes(); err == nil {
+		t.Fatal("expected error for missing recipes_dir, got nil")
+	}
+}
+
+// mustMkRecipe creates an empty-but-valid recipe directory. Used by
+// reload tests where build correctness doesn't matter — we only care
+// that the loader sees the recipe.
+func mustMkRecipe(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `
+[meta]
+license = "MIT"
+homepage = "https://example.com"
+build_script = "build.sh"
+
+[[package]]
+name = "x"
+architecture = "noarch"
+description = "test"
+files = []
+`
+	if err := os.WriteFile(filepath.Join(dir, "peipkg.toml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAlreadyPublishedReturnsFalseOnEmptyRepo(t *testing.T) {
 	mgr := &Manager{repoDir: t.TempDir()}
 	got, err := mgr.alreadyPublished("anything", "1.0-1")

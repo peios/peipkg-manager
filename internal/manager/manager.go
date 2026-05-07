@@ -12,6 +12,11 @@
 //   - Drain the trigger channel: dedupe each trigger against the
 //     published archive, build the new ones sequentially, publish each
 //     successful build, optionally rclone-sync the result.
+//   - Reload the recipe roster on demand (Reload, called from a SIGHUP
+//     handler) without restarting the process: cancel the current
+//     watcher epoch, re-read recipes_dir, start a fresh watcher epoch.
+//     In-flight builds use the outer context and run to completion
+//     across reloads.
 //   - Shut down cleanly on SIGTERM/SIGINT (cancel context, drain
 //     in-flight build, exit).
 package manager
@@ -37,13 +42,11 @@ import (
 
 // Manager is the assembled daemon. Construct via New, run via Run.
 type Manager struct {
-	cfg     config.Config
-	logger  *slog.Logger
-	recipes []recipe.Recipe
+	cfg    config.Config
+	logger *slog.Logger
 
 	runner    *build.Runner
 	publisher *publish.Publisher
-	watcher   *watch.Watcher
 
 	repoDir    string // <state_dir>/repo, kept here so dedup checks don't have to reach through publisher
 	stagingDir string // where successful build outputs are accumulated before publish
@@ -51,11 +54,23 @@ type Manager struct {
 	// Webhook secret loaded once from disk; nil if no HTTP server.
 	webhookSecret string
 
+	// reloadCh is the buffered (size 1) signal channel used by Reload to
+	// request a recipe-roster reload. The lifecycle goroutine inside
+	// Run consumes from it. Coalesced — a Reload while one is pending
+	// is dropped silently.
+	reloadCh chan struct{}
+
 	// Build failure tracking — keyed by recipeID+"@"+version. In-memory
 	// only; daemon restart loses state and aggressively retries every
 	// recipe (which is fine — restart is rare and failures are
 	// well-logged).
-	mu              sync.Mutex
+	mu sync.Mutex
+	// recipes is the current roster, mutated by Reload. The lifecycle
+	// goroutine snapshots it under mu before constructing each watcher
+	// epoch.
+	recipes []recipe.Recipe
+	// watcher points at the current epoch's watcher; tests inspect this.
+	watcher         *watch.Watcher
 	failures        map[string]failureRecord
 	inFlight        *inFlightBuild
 	buildsAttempted int
@@ -181,36 +196,83 @@ func New(cfg config.Config, opts Options) (*Manager, error) {
 		repoDir:       repoDir,
 		stagingDir:    filepath.Join(cfg.Manager.StateDir, "publish"),
 		webhookSecret: secret,
+		reloadCh:      make(chan struct{}, 1),
 	}, nil
 }
 
 // Run is the long-running daemon loop. It returns when ctx is
 // cancelled, after waiting for the in-flight build (if any) to
 // complete and shutting down the watcher.
+//
+// The watcher runs in epochs: each epoch is one Watcher.Run lifetime,
+// scoped to an inner context derived from ctx. Reload cancels the
+// current epoch's context and the lifecycle goroutine starts a fresh
+// epoch with the freshly-loaded recipe roster. The HTTP server is
+// inside the watcher, so it briefly bounces during a reload — this is
+// a sub-second blip and is acceptable for the cron-driven recipe
+// refresh that drives most reloads.
+//
+// In-flight builds use ctx (not the epoch context), so a reload does
+// not interrupt them. They run to completion across the watcher
+// transition.
 func (m *Manager) Run(ctx context.Context) error {
 	if err := m.ensureRepoInitialised(ctx); err != nil {
 		return fmt.Errorf("initialise repo: %w", err)
 	}
 
+	// Single trigger channel reused across watcher epochs. Closed by
+	// the lifecycle goroutine on outer-ctx cancel.
 	triggers := make(chan watch.Trigger, 1024)
-	m.watcher = &watch.Watcher{
-		Recipes:       m.recipes,
-		DefaultPoll:   m.cfg.Poll.DefaultInterval.Duration,
-		WebhookSecret: m.webhookSecret,
-		HTTPAddr:      m.cfg.HTTP.Addr,
-		Logger:        m.logger,
-		Triggers:      triggers,
-		StatusHandler: m.statusHandler(),
-	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
+	var lifecycleWg sync.WaitGroup
+	lifecycleWg.Add(1)
 	go func() {
-		defer wg.Done()
-		if err := m.watcher.Run(ctx); err != nil {
-			m.logger.Error("watcher exited", "err", err)
+		defer lifecycleWg.Done()
+		defer close(triggers)
+		for {
+			m.mu.Lock()
+			recipes := append([]recipe.Recipe(nil), m.recipes...)
+			m.mu.Unlock()
+
+			epochCtx, epochCancel := context.WithCancel(ctx)
+			w := &watch.Watcher{
+				Recipes:       recipes,
+				DefaultPoll:   m.cfg.Poll.DefaultInterval.Duration,
+				WebhookSecret: m.webhookSecret,
+				HTTPAddr:      m.cfg.HTTP.Addr,
+				Logger:        m.logger,
+				Triggers:      triggers,
+				StatusHandler: m.statusHandler(),
+			}
+			m.mu.Lock()
+			m.watcher = w
+			m.mu.Unlock()
+
+			watcherDone := make(chan struct{})
+			go func() {
+				defer close(watcherDone)
+				if err := w.Run(epochCtx); err != nil {
+					m.logger.Error("watcher exited", "err", err)
+				}
+			}()
+
+			select {
+			case <-ctx.Done():
+				epochCancel()
+				<-watcherDone
+				return
+			case <-m.reloadCh:
+				m.logger.Info("reload requested; stopping watcher to swap recipe roster")
+				epochCancel()
+				<-watcherDone
+				if err := m.loadRecipes(); err != nil {
+					m.logger.Error("reload: load roster failed; continuing with existing recipes", "err", err)
+					// m.recipes unchanged; the next epoch starts with
+					// the pre-reload roster. Operator is expected to
+					// fix the recipes_dir issue and reload again.
+				}
+			}
 		}
-		close(triggers)
 	}()
 
 	for trig := range triggers {
@@ -220,8 +282,44 @@ func (m *Manager) Run(ctx context.Context) error {
 		m.handleTrigger(ctx, trig)
 	}
 
-	wg.Wait()
+	lifecycleWg.Wait()
 	return ctx.Err()
+}
+
+// Reload requests that the daemon re-read its recipe roster from
+// recipes_dir and replace the watcher's recipe set. Safe to call from
+// a signal handler (non-blocking) and from any goroutine.
+//
+// Reloads are coalesced: if a reload is already pending, additional
+// calls are no-ops. New recipes pick up on the next epoch; removed
+// recipes' poll goroutines are cancelled and their ticker stops. The
+// HTTP server bounces briefly across the transition.
+//
+// Reload does not interrupt in-flight builds — they use the outer Run
+// context, which a reload does not cancel.
+func (m *Manager) Reload() {
+	if m.reloadCh == nil {
+		return
+	}
+	select {
+	case m.reloadCh <- struct{}{}:
+	default:
+		// already pending
+	}
+}
+
+// loadRecipes re-reads recipes_dir into m.recipes. Called by the
+// lifecycle goroutine inside Run after a reload signal.
+func (m *Manager) loadRecipes() error {
+	recipes, err := recipe.LoadRoster(m.cfg.Manager.RecipesDir)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.recipes = recipes
+	m.mu.Unlock()
+	m.logger.Info("recipes reloaded", "count", len(recipes), "dir", m.cfg.Manager.RecipesDir)
+	return nil
 }
 
 // RunOnce performs a single sweep: poll every recipe once in parallel,
