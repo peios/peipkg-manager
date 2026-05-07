@@ -20,13 +20,18 @@ import (
 )
 
 // Job describes one build to run.
+//
+// The build timestamp is intentionally NOT a Job field. Runner derives
+// it from the upstream tag's committer timestamp during source fetch,
+// so the same (recipe, upstream tag, peios revision) tuple produces
+// byte-identical .peipkg output regardless of when the build runs —
+// even years apart.
 type Job struct {
 	Recipe      recipe.Recipe
 	UpstreamRef string // git tag, e.g. "v1.3.2"
 	Version     string // peipkg version string composed by the caller, e.g. "1.3.2-1"
 	SourceRef   string // recorded in the manifest's build.source_ref (PSD-009 §3.3.4)
 	FarmID      string
-	Timestamp   string // RFC 3339 UTC, ending in 'Z'
 	SignKeyPath string // empty = unsigned package
 }
 
@@ -36,6 +41,11 @@ type Result struct {
 	// peipkg-build produced. A multi-stanza recipe produces multiple
 	// outputs from one build.
 	Outputs []string
+
+	// Timestamp is the RFC 3339 UTC timestamp the build used as
+	// peipkg-build's --timestamp flag, derived from the upstream
+	// tag's committer timestamp. Surfaced for logging and audit.
+	Timestamp string
 }
 
 // Runner holds invocation-time settings shared across builds.
@@ -83,7 +93,8 @@ func (r *Runner) Run(ctx context.Context, job Job) (*Result, error) {
 		return nil, fmt.Errorf("create %s: %w", stageDir, err)
 	}
 
-	if err := source.Fetch(ctx, job.Recipe.Upstream.Git, job.UpstreamRef, sourceDir); err != nil {
+	commitTime, err := source.Fetch(ctx, job.Recipe.Upstream.Git, job.UpstreamRef, sourceDir)
+	if err != nil {
 		_ = os.RemoveAll(stageDir)
 		return nil, fmt.Errorf("fetch source: %w", err)
 	}
@@ -96,7 +107,7 @@ func (r *Runner) Run(ctx context.Context, job Job) (*Result, error) {
 		"--version", job.Version,
 		"--source-ref", job.SourceRef,
 		"--farm-id", job.FarmID,
-		"--timestamp", job.Timestamp,
+		"--timestamp", commitTime,
 		"--out", stageDir,
 	}
 	if job.SignKeyPath != "" {
@@ -118,7 +129,7 @@ func (r *Runner) Run(ctx context.Context, job Job) (*Result, error) {
 	if len(outputs) == 0 {
 		return nil, fmt.Errorf("peipkg-build succeeded but produced no .peipkg files in %s", stageDir)
 	}
-	return &Result{Outputs: outputs}, nil
+	return &Result{Outputs: outputs, Timestamp: commitTime}, nil
 }
 
 func collectOutputs(stageDir string) ([]string, error) {

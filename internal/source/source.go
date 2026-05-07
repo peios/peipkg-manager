@@ -27,7 +27,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // ListTags returns the names of every tag the remote at repoURL
@@ -76,6 +78,12 @@ func ListTags(ctx context.Context, repoURL string) ([]string, error) {
 // dst's parent must exist. The clone is shallow (depth 1) so even
 // large upstream histories transfer quickly.
 //
+// Returns the tag's committer timestamp formatted as RFC 3339 UTC
+// (`2024-03-15T10:30:00Z`). Callers use this as the build's
+// `--timestamp` so .peipkg bytes are reproducible from the same
+// upstream tag regardless of when the build runs — the tag's commit
+// time never changes, but `time.Now()` does.
+//
 // On success, dst contains a regular working tree at the requested
 // tag with no .git/ directory: the source is presented as upstream
 // would ship it (via `git archive` or a release tarball), so build
@@ -88,11 +96,11 @@ func ListTags(ctx context.Context, repoURL string) ([]string, error) {
 // the upstream-supplied version string from the tag rather than
 // re-deriving it from git, but if a real recipe needs the metadata,
 // Fetch can grow a "keep .git/" option.
-func Fetch(ctx context.Context, repoURL, tag, dst string) error {
+func Fetch(ctx context.Context, repoURL, tag, dst string) (commitTime string, err error) {
 	if _, err := os.Stat(dst); err == nil {
-		return fmt.Errorf("destination already exists: %s", dst)
+		return "", fmt.Errorf("destination already exists: %s", dst)
 	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("stat %s: %w", dst, err)
+		return "", fmt.Errorf("stat %s: %w", dst, err)
 	}
 
 	cmd := exec.CommandContext(ctx, "git", "clone",
@@ -109,12 +117,39 @@ func Fetch(ctx context.Context, repoURL, tag, dst string) error {
 		// the caller — Fetch's contract is "doesn't exist before,
 		// failure may leave junk." That mirrors how operators expect
 		// failed builds to be handled.
-		return fmt.Errorf("git clone --branch %s %s: %w", tag, repoURL, err)
+		return "", fmt.Errorf("git clone --branch %s %s: %w", tag, repoURL, err)
+	}
+
+	// Read the committer timestamp BEFORE we strip .git/.
+	commitTime, err = readCommitTime(ctx, dst)
+	if err != nil {
+		return "", fmt.Errorf("read commit time at %s in %s: %w", tag, repoURL, err)
 	}
 
 	// Strip .git/ so the source tree is presented as a clean snapshot.
 	if err := os.RemoveAll(filepath.Join(dst, ".git")); err != nil {
-		return fmt.Errorf("strip .git/ from cloned source: %w", err)
+		return "", fmt.Errorf("strip .git/ from cloned source: %w", err)
 	}
-	return nil
+	return commitTime, nil
+}
+
+// readCommitTime returns the committer timestamp of HEAD in workTree,
+// formatted as RFC 3339 UTC (ending in 'Z'). The output of
+// `git log -1 --format=%ct` is a UNIX seconds value which we parse and
+// reformat — that route is more deterministic than asking git directly
+// for an ISO format, because git's %cI uses the committer's local
+// timezone offset rather than UTC.
+func readCommitTime(ctx context.Context, workTree string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", workTree, "log", "-1", "--format=%ct", "HEAD")
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	secsStr := strings.TrimSpace(string(out))
+	secs, err := strconv.ParseInt(secsStr, 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("parse %q as unix timestamp: %w", secsStr, err)
+	}
+	return time.Unix(secs, 0).UTC().Format(time.RFC3339), nil
 }

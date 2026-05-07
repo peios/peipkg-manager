@@ -57,6 +57,12 @@ type Watcher struct {
 	Logger        *slog.Logger
 	Triggers      chan<- Trigger
 
+	// StatusHandler, when non-nil, is mounted at /status on the
+	// webhook HTTP server. Used by the manager to expose its own
+	// state (in-flight builds, failure records, etc.) without making
+	// the watcher aware of the manager's internals.
+	StatusHandler http.Handler
+
 	// patterns is a per-recipe compiled tag regex, shared across the
 	// poll loop and the webhook handler.
 	patterns map[string]*regexp.Regexp
@@ -99,6 +105,33 @@ func (w *Watcher) Run(ctx context.Context) error {
 		}()
 	}
 
+	wg.Wait()
+	return nil
+}
+
+// RunOnce polls every recipe with [upstream] config in parallel,
+// emits triggers as it finds matching tags, and returns when all
+// polls have completed. Used by --once mode; no ticker, no webhook
+// server.
+//
+// The caller is responsible for closing the trigger channel after
+// RunOnce returns so any downstream `for range triggers` terminates.
+func (w *Watcher) RunOnce(ctx context.Context) error {
+	if err := w.compilePatterns(); err != nil {
+		return err
+	}
+
+	var wg sync.WaitGroup
+	for _, r := range w.Recipes {
+		if !r.Upstream.HasUpstream() {
+			continue
+		}
+		wg.Add(1)
+		go func(r recipe.Recipe) {
+			defer wg.Done()
+			w.pollOnce(ctx, r)
+		}(r)
+	}
 	wg.Wait()
 	return nil
 }
@@ -173,6 +206,9 @@ func (w *Watcher) serveHTTP(ctx context.Context) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/webhooks/github", w.handleGitHubWebhook)
 	mux.HandleFunc("/healthz", func(rw http.ResponseWriter, _ *http.Request) { _, _ = rw.Write([]byte("ok\n")) })
+	if w.StatusHandler != nil {
+		mux.Handle("/status", w.StatusHandler)
+	}
 
 	server := &http.Server{
 		Addr:              w.HTTPAddr,

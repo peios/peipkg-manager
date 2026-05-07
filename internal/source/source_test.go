@@ -72,8 +72,16 @@ func TestFetchLocalRepo(t *testing.T) {
 	repo := makeLocalRepo(t, t.TempDir(), []string{"v1.0.0", "v2.0.0"})
 
 	dst := filepath.Join(t.TempDir(), "checkout")
-	if err := Fetch(context.Background(), repo, "v2.0.0", dst); err != nil {
+	commitTime, err := Fetch(context.Background(), repo, "v2.0.0", dst)
+	if err != nil {
 		t.Fatal(err)
+	}
+	// Returned commit time must be RFC 3339 UTC (ends with Z).
+	if commitTime == "" {
+		t.Error("Fetch returned empty commitTime")
+	}
+	if got := commitTime[len(commitTime)-1]; got != 'Z' {
+		t.Errorf("commitTime = %q, want trailing Z", commitTime)
 	}
 
 	body, err := os.ReadFile(filepath.Join(dst, "f"))
@@ -83,13 +91,37 @@ func TestFetchLocalRepo(t *testing.T) {
 	if string(body) != "v2.0.0" {
 		t.Errorf("checked-out content = %q, want %q", body, "v2.0.0")
 	}
+
+	// .git/ should have been stripped.
+	if _, err := os.Stat(filepath.Join(dst, ".git")); !os.IsNotExist(err) {
+		t.Errorf(".git/ leaked through (stat err: %v)", err)
+	}
+}
+
+func TestFetchCommitTimeIsStable(t *testing.T) {
+	// Two clones of the same tag should yield the same commit time.
+	// (`git commit` records the committer time at first commit; subsequent
+	// fetches don't change it.)
+	repo := makeLocalRepo(t, t.TempDir(), []string{"v1.0.0"})
+
+	a, err := Fetch(context.Background(), repo, "v1.0.0", filepath.Join(t.TempDir(), "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Fetch(context.Background(), repo, "v1.0.0", filepath.Join(t.TempDir(), "b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a != b {
+		t.Errorf("commit times differ across fetches: %q vs %q", a, b)
+	}
 }
 
 func TestFetchRefusesExistingDst(t *testing.T) {
 	repo := makeLocalRepo(t, t.TempDir(), []string{"v1.0.0"})
 	dst := t.TempDir() // exists
 
-	err := Fetch(context.Background(), repo, "v1.0.0", dst)
+	_, err := Fetch(context.Background(), repo, "v1.0.0", dst)
 	if err == nil {
 		t.Error("Fetch should refuse to overwrite an existing dst")
 	}

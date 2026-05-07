@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/peios/peipkg-manager/internal/config"
+	"github.com/peios/peipkg-manager/internal/recipe"
 )
 
 func TestComposeVersion(t *testing.T) {
@@ -43,6 +45,149 @@ func TestComposeSourceRef(t *testing.T) {
 	want := "git+https://github.com/example/foo#refs/tags/v1.0.0"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestBackoffSchedule(t *testing.T) {
+	cases := []struct {
+		failures int
+		want     time.Duration
+	}{
+		{0, 1 * time.Minute}, // negative becomes index 0 → 1m (defensive)
+		{1, 1 * time.Minute},
+		{2, 5 * time.Minute},
+		{3, 15 * time.Minute},
+		{4, 1 * time.Hour},
+		{5, 6 * time.Hour},
+		{6, 24 * time.Hour},
+		{7, 24 * time.Hour}, // capped
+		{99, 24 * time.Hour},
+	}
+	for _, c := range cases {
+		got := backoffFor(c.failures)
+		if got != c.want {
+			t.Errorf("backoffFor(%d) = %v, want %v", c.failures, got, c.want)
+		}
+	}
+}
+
+func TestStatusSnapshotAndHandler(t *testing.T) {
+	mgr := &Manager{
+		cfg: config.Config{
+			Manager: config.Manager{ID: "test-farm"},
+		},
+		recipes: []recipe.Recipe{
+			{ID: "alpha"},
+			{ID: "libfoo"},
+		},
+	}
+
+	// Empty snapshot.
+	s := mgr.snapshot()
+	if s.FarmID != "test-farm" {
+		t.Errorf("FarmID = %q", s.FarmID)
+	}
+	if len(s.Recipes) != 2 || s.Recipes[0] != "alpha" || s.Recipes[1] != "libfoo" {
+		t.Errorf("Recipes = %v", s.Recipes)
+	}
+	if s.InFlight != nil {
+		t.Errorf("InFlight should be nil at startup, got %+v", s.InFlight)
+	}
+	if s.BuildsAttempted != 0 || s.BuildsSucceeded != 0 {
+		t.Errorf("counters should be 0, got attempted=%d succeeded=%d", s.BuildsAttempted, s.BuildsSucceeded)
+	}
+
+	// Mid-build snapshot.
+	mgr.markInFlight("libfoo", "1.2.3-1")
+	s = mgr.snapshot()
+	if s.InFlight == nil {
+		t.Fatal("InFlight should be set after markInFlight")
+	}
+	if s.InFlight.Recipe != "libfoo" || s.InFlight.Version != "1.2.3-1" {
+		t.Errorf("InFlight = %+v", s.InFlight)
+	}
+	if s.BuildsAttempted != 1 {
+		t.Errorf("BuildsAttempted = %d, want 1", s.BuildsAttempted)
+	}
+
+	mgr.recordSuccess()
+	mgr.clearInFlight()
+	s = mgr.snapshot()
+	if s.BuildsSucceeded != 1 {
+		t.Errorf("BuildsSucceeded = %d, want 1", s.BuildsSucceeded)
+	}
+	if s.InFlight != nil {
+		t.Errorf("InFlight should be nil after clearInFlight, got %+v", s.InFlight)
+	}
+
+	// Failure surfaces in the snapshot.
+	mgr.recordFailure("alpha", "0.5-1")
+	s = mgr.snapshot()
+	if len(s.Failures) != 1 {
+		t.Fatalf("Failures count = %d", len(s.Failures))
+	}
+	rep, ok := s.Failures["alpha@0.5-1"]
+	if !ok {
+		t.Fatalf("missing failure key, got: %v", s.Failures)
+	}
+	if rep.Failures != 1 {
+		t.Errorf("failure count = %d, want 1", rep.Failures)
+	}
+
+	// HTTP handler renders the snapshot as JSON.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/status", nil)
+	mgr.statusHandler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Errorf("HTTP status = %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	var got Status
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v\n%s", err, rec.Body.String())
+	}
+	if got.FarmID != "test-farm" {
+		t.Errorf("decoded FarmID = %q", got.FarmID)
+	}
+}
+
+func TestFailureLifecycle(t *testing.T) {
+	mgr := &Manager{}
+
+	// Fresh state: every (recipe, version) is eligible.
+	if !mgr.shouldRetry("foo", "1.0-1") {
+		t.Error("fresh recipe should be eligible to retry")
+	}
+
+	// After a failure: should be in backoff for a minute.
+	d := mgr.recordFailure("foo", "1.0-1")
+	if d != 1*time.Minute {
+		t.Errorf("first-failure backoff = %v, want 1m", d)
+	}
+	if mgr.shouldRetry("foo", "1.0-1") {
+		t.Error("just-failed recipe should be in backoff window")
+	}
+
+	// Different (recipe, version) should be unaffected.
+	if !mgr.shouldRetry("foo", "1.0-2") {
+		t.Error("different version should not inherit failure state")
+	}
+	if !mgr.shouldRetry("bar", "1.0-1") {
+		t.Error("different recipe should not inherit failure state")
+	}
+
+	// Second failure escalates the backoff.
+	d2 := mgr.recordFailure("foo", "1.0-1")
+	if d2 != 5*time.Minute {
+		t.Errorf("second-failure backoff = %v, want 5m", d2)
+	}
+
+	// Clear: back to fresh.
+	mgr.clearFailure("foo", "1.0-1")
+	if !mgr.shouldRetry("foo", "1.0-1") {
+		t.Error("cleared recipe should be eligible again")
 	}
 }
 
@@ -165,36 +310,23 @@ default_interval = "1m"
 		t.Fatalf("New: %v", err)
 	}
 
-	// Run for a few seconds — long enough for poll → dedup → build →
-	// publish to complete, short enough not to drag out the test.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// RunOnce: poll all recipes once, process triggers, exit. No
+	// timing dance with cancellation — RunOnce returns when the work
+	// is done, so the test waits exactly as long as the actual build
+	// pipeline takes.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-
-	done := make(chan error, 1)
-	go func() { done <- mgr.Run(ctx) }()
-
-	// Poll the active index until it contains a hello entry, or fail
-	// after a timeout. The poll → build → publish cycle is roughly
-	// "ls-remote + 1 git clone + peipkg-build + peipkg-repo publish",
-	// which is well under 10 seconds on typical hardware.
-	deadline := time.Now().Add(20 * time.Second)
-	activePath := filepath.Join(stateDir, "repo", "index", "active.json")
-	for {
-		if time.Now().After(deadline) {
-			cancel()
-			<-done
-			t.Fatalf("active.json never contained a hello entry within timeout")
-		}
-		data, err := os.ReadFile(activePath)
-		if err == nil && strings.Contains(string(data), `"name":"hello"`) {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
+	if err := mgr.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
 	}
 
-	cancel()
-	if err := <-done; err != nil && err != context.Canceled {
-		t.Errorf("manager.Run returned non-cancel error: %v", err)
+	activePath := filepath.Join(stateDir, "repo", "index", "active.json")
+	data, err := os.ReadFile(activePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"name":"hello"`) {
+		t.Fatalf("active.json missing hello entry:\n%s", data)
 	}
 
 	// Inspect the archive: both versions should have built.

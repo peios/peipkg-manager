@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,6 +50,59 @@ type Manager struct {
 
 	// Webhook secret loaded once from disk; nil if no HTTP server.
 	webhookSecret string
+
+	// Build failure tracking — keyed by recipeID+"@"+version. In-memory
+	// only; daemon restart loses state and aggressively retries every
+	// recipe (which is fine — restart is rare and failures are
+	// well-logged).
+	mu              sync.Mutex
+	failures        map[string]failureRecord
+	inFlight        *inFlightBuild
+	buildsAttempted int
+	buildsSucceeded int
+}
+
+// inFlightBuild describes the build the manager is currently working on,
+// for status reporting. Set when a job enters the runner, cleared when
+// the job completes (regardless of outcome).
+type inFlightBuild struct {
+	Recipe    string    `json:"recipe"`
+	Version   string    `json:"version"`
+	StartedAt time.Time `json:"started_at"`
+}
+
+// failureRecord tracks one (recipe, version) build that has failed at
+// least once. Backoff is exponential: 1m, 5m, 15m, 1h, 6h, 24h, capped
+// at 24h. The schedule keeps churn for transient failures (network, a
+// flaky build) low and bounded, but allows persistent failures (a
+// genuinely broken recipe) to retry once a day so a fix is picked up
+// without needing operator intervention.
+type failureRecord struct {
+	failures  int
+	nextRetry time.Time
+}
+
+// backoffSchedule defines how long to wait before retrying after the
+// 1st, 2nd, 3rd, ... consecutive failure. Exhausted entries reuse the
+// last (24h).
+var backoffSchedule = []time.Duration{
+	1 * time.Minute,
+	5 * time.Minute,
+	15 * time.Minute,
+	1 * time.Hour,
+	6 * time.Hour,
+	24 * time.Hour,
+}
+
+func backoffFor(failures int) time.Duration {
+	i := failures - 1
+	if i < 0 {
+		i = 0
+	}
+	if i >= len(backoffSchedule) {
+		i = len(backoffSchedule) - 1
+	}
+	return backoffSchedule[i]
 }
 
 // Options collects construction-time inputs that aren't in the
@@ -146,6 +200,7 @@ func (m *Manager) Run(ctx context.Context) error {
 		HTTPAddr:      m.cfg.HTTP.Addr,
 		Logger:        m.logger,
 		Triggers:      triggers,
+		StatusHandler: m.statusHandler(),
 	}
 
 	var wg sync.WaitGroup
@@ -169,6 +224,47 @@ func (m *Manager) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
+// RunOnce performs a single sweep: poll every recipe once in parallel,
+// process every emitted trigger, and exit. No webhook server, no
+// ticker. Suitable for cron jobs, CI rebuilds, and manual operator
+// "rebuild whatever's stale" runs.
+//
+// Returns when the trigger channel drains. Build/publish failures are
+// logged but do not abort the sweep — the next invocation can retry.
+func (m *Manager) RunOnce(ctx context.Context) error {
+	if err := m.ensureRepoInitialised(ctx); err != nil {
+		return fmt.Errorf("initialise repo: %w", err)
+	}
+
+	triggers := make(chan watch.Trigger, 1024)
+	m.watcher = &watch.Watcher{
+		Recipes:     m.recipes,
+		DefaultPoll: m.cfg.Poll.DefaultInterval.Duration,
+		Logger:      m.logger,
+		Triggers:    triggers,
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := m.watcher.RunOnce(ctx); err != nil {
+			m.logger.Error("watcher RunOnce", "err", err)
+		}
+		close(triggers)
+	}()
+
+	for trig := range triggers {
+		if ctx.Err() != nil {
+			break
+		}
+		m.handleTrigger(ctx, trig)
+	}
+
+	wg.Wait()
+	return ctx.Err()
+}
+
 // ensureRepoInitialised creates a fresh repository state on first run.
 // Idempotent — called every Run; subsequent invocations no-op.
 func (m *Manager) ensureRepoInitialised(ctx context.Context) error {
@@ -176,12 +272,15 @@ func (m *Manager) ensureRepoInitialised(ctx context.Context) error {
 }
 
 // handleTrigger processes one watch trigger end-to-end: dedupe against
-// the archive, build, publish on success.
+// the archive, check the failure-backoff schedule, build, publish on
+// success.
 //
-// Build failures are logged and dropped — the next poll cycle will
-// re-emit a trigger for the same tag, giving a natural retry. Publish
-// failures are logged but do not undo the build (the .peipkg sits in
-// the publish staging dir for next attempt).
+// Build failures are logged AND recorded in the failure cache. The
+// next poll cycle re-emits a trigger for the same tag, but the
+// trigger is skipped until the backoff window elapses. This caps
+// log churn for persistently-failing builds (one failure per backoff
+// interval, not one per poll cycle) while still retrying on every
+// schedule tick.
 func (m *Manager) handleTrigger(ctx context.Context, trig watch.Trigger) {
 	version := composeVersion(trig.Captured, trig.Recipe.Upstream.PeiosRevision)
 
@@ -194,9 +293,18 @@ func (m *Manager) handleTrigger(ctx context.Context, trig watch.Trigger) {
 		return
 	}
 
+	if !m.shouldRetry(trig.Recipe.ID, version) {
+		m.logger.Debug("trigger skipped (in failure backoff window)",
+			"recipe", trig.Recipe.ID, "version", version, "source", trig.Source)
+		return
+	}
+
 	m.logger.Info("starting build",
 		"recipe", trig.Recipe.ID, "tag", trig.UpstreamTag,
 		"version", version, "source", trig.Source)
+
+	m.markInFlight(trig.Recipe.ID, version)
+	defer m.clearInFlight()
 
 	job := build.Job{
 		Recipe:      trig.Recipe,
@@ -204,12 +312,14 @@ func (m *Manager) handleTrigger(ctx context.Context, trig watch.Trigger) {
 		Version:     version,
 		SourceRef:   composeSourceRef(trig.Recipe.Upstream.Git, trig.UpstreamTag),
 		FarmID:      m.cfg.Manager.ID,
-		Timestamp:   nowRFC3339(),
 		SignKeyPath: m.cfg.Signing.KeyFile,
 	}
 	res, err := m.runner.Run(ctx, job)
 	if err != nil {
-		m.logger.Error("build failed", "recipe", trig.Recipe.ID, "version", version, "err", err)
+		next := m.recordFailure(trig.Recipe.ID, version)
+		m.logger.Error("build failed",
+			"recipe", trig.Recipe.ID, "version", version,
+			"err", err, "next_retry_after", next)
 		return
 	}
 
@@ -221,21 +331,163 @@ func (m *Manager) handleTrigger(ctx context.Context, trig watch.Trigger) {
 	}
 
 	if err := m.publisher.Publish(ctx, m.stagingDir, nowRFC3339()); err != nil {
-		m.logger.Error("publish failed", "err", err)
+		next := m.recordFailure(trig.Recipe.ID, version)
+		m.logger.Error("publish failed",
+			"recipe", trig.Recipe.ID, "version", version,
+			"err", err, "next_retry_after", next)
 		// Outputs remain in stagingDir; next successful build will
 		// publish them along with its own.
 		return
 	}
 
-	// Publish succeeded — clear stagingDir so the next build doesn't
-	// re-publish the same files.
+	// Build + publish succeeded — clear failure record (this version
+	// is now considered a success) and clear stagingDir so the next
+	// build doesn't re-publish the same files.
+	m.clearFailure(trig.Recipe.ID, version)
+	m.recordSuccess()
 	if err := clearDir(m.stagingDir); err != nil {
 		m.logger.Warn("clear staging dir failed", "err", err)
 	}
 
 	m.logger.Info("build + publish complete",
 		"recipe", trig.Recipe.ID, "version", version,
-		"outputs", len(res.Outputs))
+		"outputs", len(res.Outputs), "build_timestamp", res.Timestamp)
+}
+
+// markInFlight records that the manager has started work on (recipe,
+// version). Also bumps the attempted-builds counter.
+func (m *Manager) markInFlight(recipeID, version string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inFlight = &inFlightBuild{
+		Recipe:    recipeID,
+		Version:   version,
+		StartedAt: time.Now().UTC(),
+	}
+	m.buildsAttempted++
+}
+
+func (m *Manager) clearInFlight() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inFlight = nil
+}
+
+func (m *Manager) recordSuccess() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.buildsSucceeded++
+}
+
+// shouldRetry reports whether a (recipe, version) build that previously
+// failed is now eligible for a retry. Returns true for the first attempt
+// (no failure record yet) or after the backoff window has elapsed.
+func (m *Manager) shouldRetry(recipeID, version string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.failures[failureKey(recipeID, version)]
+	if !ok {
+		return true
+	}
+	return time.Now().After(rec.nextRetry)
+}
+
+// recordFailure increments the failure count for (recipe, version) and
+// computes the next retry time. Returns the duration until that retry,
+// for log surfacing.
+func (m *Manager) recordFailure(recipeID, version string) time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failures == nil {
+		m.failures = make(map[string]failureRecord)
+	}
+	k := failureKey(recipeID, version)
+	rec := m.failures[k]
+	rec.failures++
+	d := backoffFor(rec.failures)
+	rec.nextRetry = time.Now().Add(d)
+	m.failures[k] = rec
+	return d
+}
+
+// clearFailure removes the failure record for (recipe, version). Called
+// after a successful build+publish.
+func (m *Manager) clearFailure(recipeID, version string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.failures, failureKey(recipeID, version))
+}
+
+func failureKey(recipeID, version string) string {
+	return recipeID + "@" + version
+}
+
+// Status is the JSON payload returned by the /status endpoint.
+type Status struct {
+	FarmID          string                   `json:"farm_id"`
+	Recipes         []string                 `json:"recipes"`
+	BuildsAttempted int                      `json:"builds_attempted"`
+	BuildsSucceeded int                      `json:"builds_succeeded"`
+	InFlight        *inFlightBuild           `json:"in_flight,omitempty"`
+	Failures        map[string]failureReport `json:"failures,omitempty"`
+}
+
+// failureReport is the JSON-friendly view of a failureRecord.
+type failureReport struct {
+	Failures  int       `json:"failures"`
+	NextRetry time.Time `json:"next_retry"`
+}
+
+// snapshot returns the current Status under the manager's lock. Used
+// by the HTTP handler and by tests.
+func (m *Manager) snapshot() Status {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	recipes := make([]string, len(m.recipes))
+	for i, r := range m.recipes {
+		recipes[i] = r.ID
+	}
+
+	var inFlight *inFlightBuild
+	if m.inFlight != nil {
+		copy := *m.inFlight
+		inFlight = &copy
+	}
+
+	var failures map[string]failureReport
+	if len(m.failures) > 0 {
+		failures = make(map[string]failureReport, len(m.failures))
+		for k, v := range m.failures {
+			failures[k] = failureReport{
+				Failures:  v.failures,
+				NextRetry: v.nextRetry.UTC(),
+			}
+		}
+	}
+
+	return Status{
+		FarmID:          m.cfg.Manager.ID,
+		Recipes:         recipes,
+		BuildsAttempted: m.buildsAttempted,
+		BuildsSucceeded: m.buildsSucceeded,
+		InFlight:        inFlight,
+		Failures:        failures,
+	}
+}
+
+// statusHandler returns an http.Handler that serves the manager's
+// current state as JSON.
+func (m *Manager) statusHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(m.snapshot()); err != nil {
+			http.Error(w, "encode status", http.StatusInternalServerError)
+			return
+		}
+	})
 }
 
 // stageForPublish moves the per-build outputs into the shared publish

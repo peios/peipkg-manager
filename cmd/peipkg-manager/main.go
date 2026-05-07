@@ -26,6 +26,7 @@ const defaultConfigPath = "/etc/peipkg-manager/config.toml"
 func main() {
 	configPath := flag.String("config", defaultConfigPath, "path to peipkg-config.toml")
 	logLevel := flag.String("log-level", "info", "log verbosity: debug, info, warn, error")
+	once := flag.Bool("once", false, "run a single poll/build/publish sweep and exit (cron/CI mode); default is the long-running daemon")
 	flag.Parse()
 
 	logger, err := newLogger(*logLevel)
@@ -49,8 +50,15 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	logger.Info("peipkg-manager starting", "config", *configPath, "farm_id", cfg.Manager.ID)
-	if err := mgr.Run(ctx); err != nil && err != context.Canceled {
+	mode := "daemon"
+	runFn := mgr.Run
+	if *once {
+		mode = "once"
+		runFn = mgr.RunOnce
+	}
+
+	logger.Info("peipkg-manager starting", "config", *configPath, "farm_id", cfg.Manager.ID, "mode", mode)
+	if err := runFn(ctx); err != nil && err != context.Canceled {
 		logger.Error("manager exited with error", "err", err)
 		os.Exit(1)
 	}
