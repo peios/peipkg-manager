@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackgpalfrey/peipkg-manager/internal/config"
+	"github.com/peios/peipkg-manager/internal/config"
 )
 
 func TestComposeVersion(t *testing.T) {

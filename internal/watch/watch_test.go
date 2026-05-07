@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackgpalfrey/peipkg-manager/internal/recipe"
+	"github.com/peios/peipkg-manager/internal/recipe"
 )
 
 // makeLocalRepo mirrors source_test's helper — the watch poll needs a

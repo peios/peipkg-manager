@@ -33,8 +33,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackgpalfrey/peipkg-manager/internal/recipe"
-	"github.com/jackgpalfrey/peipkg-manager/internal/source"
+	"github.com/peios/peipkg-manager/internal/recipe"
+	"github.com/peios/peipkg-manager/internal/source"
 )
 
 // Trigger reports one (recipe, upstream tag) pair the manager should

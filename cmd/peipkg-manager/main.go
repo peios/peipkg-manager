@@ -17,8 +17,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/jackgpalfrey/peipkg-manager/internal/config"
-	"github.com/jackgpalfrey/peipkg-manager/internal/manager"
+	"github.com/peios/peipkg-manager/internal/config"
+	"github.com/peios/peipkg-manager/internal/manager"
 )
 
 const defaultConfigPath = "/etc/peipkg-manager/config.toml"

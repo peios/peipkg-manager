@@ -27,11 +27,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackgpalfrey/peipkg-manager/internal/build"
-	"github.com/jackgpalfrey/peipkg-manager/internal/config"
-	"github.com/jackgpalfrey/peipkg-manager/internal/publish"
-	"github.com/jackgpalfrey/peipkg-manager/internal/recipe"
-	"github.com/jackgpalfrey/peipkg-manager/internal/watch"
+	"github.com/peios/peipkg-manager/internal/build"
+	"github.com/peios/peipkg-manager/internal/config"
+	"github.com/peios/peipkg-manager/internal/publish"
+	"github.com/peios/peipkg-manager/internal/recipe"
+	"github.com/peios/peipkg-manager/internal/watch"
 )
 
 // Manager is the assembled daemon. Construct via New, run via Run.

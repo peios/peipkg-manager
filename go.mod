@@ -1,4 +1,4 @@
-module github.com/jackgpalfrey/peipkg-manager
+module github.com/peios/peipkg-manager
 
 go 1.26.2
 

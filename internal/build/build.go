@@ -15,8 +15,8 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/jackgpalfrey/peipkg-manager/internal/recipe"
-	"github.com/jackgpalfrey/peipkg-manager/internal/source"
+	"github.com/peios/peipkg-manager/internal/recipe"
+	"github.com/peios/peipkg-manager/internal/source"
 )
 
 // Job describes one build to run.

@@ -21,7 +21,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"github.com/jackgpalfrey/peipkg-manager/internal/config"
+	"github.com/peios/peipkg-manager/internal/config"
 )
 
 // Recipe is one recipe's manager-relevant view. ID is the recipe's
