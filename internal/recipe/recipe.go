@@ -48,11 +48,20 @@ type Recipe struct {
 // vendor dependencies as git submodules — typical of GNU autotools
 // projects that pull in gnulib, or any project where the source tree
 // requires submodule contents to bootstrap or build.
+//
+// MinVersion (optional) is the lowest upstream version this recipe
+// claims to package successfully. Tags whose captured version is
+// older are silently filtered before reaching the build queue. Use
+// it to skip ancient tags whose build conventions are too different
+// from the recipe to handle (typical for long-lived GNU projects:
+// the build system has changed materially across decades). Empty
+// means no floor — every matching tag is built.
 type Upstream struct {
 	Git           string `toml:"git"`
 	TagPattern    string `toml:"tag_pattern"`
 	PeiosRevision int    `toml:"peios_revision"`
 	Submodules    bool   `toml:"submodules"`
+	MinVersion    string `toml:"min_version"`
 }
 
 // HasUpstream reports whether the recipe has enough upstream config to

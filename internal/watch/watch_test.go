@@ -104,6 +104,78 @@ func TestPollEmitsTriggersForMatchingTags(t *testing.T) {
 	}
 }
 
+func TestPollFiltersBelowMinVersion(t *testing.T) {
+	repo := makeLocalRepo(t, t.TempDir(), []string{"v1.0.0", "v1.5.0", "v2.0.0", "v2.1.0"})
+
+	r := recipe.Recipe{
+		ID:   "test",
+		Path: "/dev/null",
+		Upstream: recipe.Upstream{
+			Git:           repo,
+			TagPattern:    `^v(\d+\.\d+\.\d+)$`,
+			PeiosRevision: 1,
+			MinVersion:    "2.0.0", // skip 1.x
+		},
+	}
+
+	triggers := make(chan Trigger, 16)
+	w := &Watcher{
+		Recipes:     []recipe.Recipe{r},
+		DefaultPoll: time.Hour,
+		Logger:      discardLogger(),
+		Triggers:    triggers,
+	}
+	if err := w.compilePatterns(); err != nil {
+		t.Fatal(err)
+	}
+
+	w.pollOnce(context.Background(), r)
+	close(triggers)
+
+	got := map[string]bool{}
+	for trig := range triggers {
+		got[trig.UpstreamTag] = true
+	}
+
+	if got["v1.0.0"] {
+		t.Error("v1.0.0 should have been filtered (< min_version 2.0.0)")
+	}
+	if got["v1.5.0"] {
+		t.Error("v1.5.0 should have been filtered (< min_version 2.0.0)")
+	}
+	if !got["v2.0.0"] {
+		t.Error("v2.0.0 should have passed (== min_version 2.0.0)")
+	}
+	if !got["v2.1.0"] {
+		t.Error("v2.1.0 should have passed (> min_version 2.0.0)")
+	}
+}
+
+func TestUpstreamGTE(t *testing.T) {
+	cases := []struct {
+		captured, minVersion string
+		want                 bool
+	}{
+		{"2.12.2", "2.12", true},
+		{"2.12", "2.12", true},
+		{"2.11", "2.12", false},
+		{"2.0", "1.99", true},
+		{"1.0.0", "1.0.0", true},
+		{"1.0.1", "1.0.0", true},
+		{"0.9", "1.0", false},
+	}
+	for _, c := range cases {
+		got, err := upstreamGTE(c.captured, c.minVersion)
+		if err != nil {
+			t.Errorf("upstreamGTE(%q, %q): %v", c.captured, c.minVersion, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("upstreamGTE(%q, %q) = %v, want %v", c.captured, c.minVersion, got, c.want)
+		}
+	}
+}
+
 func TestCompilePatternsRejectsInvalidRegex(t *testing.T) {
 	w := &Watcher{
 		Recipes: []recipe.Recipe{{

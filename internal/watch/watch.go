@@ -35,6 +35,7 @@ import (
 
 	"github.com/peios/peipkg-manager/internal/recipe"
 	"github.com/peios/peipkg-manager/internal/source"
+	"github.com/peios/peipkg-manager/internal/version"
 )
 
 // Trigger reports one (recipe, upstream tag) pair the manager should
@@ -186,19 +187,54 @@ func (w *Watcher) pollOnce(ctx context.Context, r recipe.Recipe) {
 
 	re := w.patterns[r.ID]
 	emitted := 0
+	skippedOld := 0
 	for _, tag := range tags {
 		m := re.FindStringSubmatch(tag)
 		if len(m) < 2 {
 			continue
 		}
+		captured := m[1]
+
+		if r.Upstream.MinVersion != "" {
+			ok, err := upstreamGTE(captured, r.Upstream.MinVersion)
+			if err != nil {
+				// Validation should be at recipe-load time; if it
+				// reaches here, tolerate by treating the tag as
+				// in-bounds rather than silently dropping every tag.
+				w.Logger.Warn("min_version comparison failed; emitting anyway",
+					"recipe", r.ID, "tag", tag, "err", err)
+			} else if !ok {
+				skippedOld++
+				continue
+			}
+		}
+
 		select {
 		case <-ctx.Done():
 			return
-		case w.Triggers <- Trigger{Recipe: r, UpstreamTag: tag, Captured: m[1], Source: "poll"}:
+		case w.Triggers <- Trigger{Recipe: r, UpstreamTag: tag, Captured: captured, Source: "poll"}:
 			emitted++
 		}
 	}
-	w.Logger.Info("poll complete", "recipe", r.ID, "tags_seen", len(tags), "matches_emitted", emitted)
+	w.Logger.Info("poll complete", "recipe", r.ID, "tags_seen", len(tags), "matches_emitted", emitted, "skipped_below_min_version", skippedOld)
+}
+
+// upstreamGTE reports whether captured >= minVersion in the PSD-009
+// §2.2 ordering. Both inputs are upstream-only strings (no peios
+// revision); we synthesize a fake "<v>-1" suffix to satisfy the
+// version package's parser, which expects full peipkg version syntax.
+// Both sides get the same revision, so revision drops out and the
+// comparison is equivalent to comparing upstream segments alone.
+func upstreamGTE(captured, minVersion string) (bool, error) {
+	a, err := version.Parse(captured + "-1")
+	if err != nil {
+		return false, fmt.Errorf("captured version %q: %w", captured, err)
+	}
+	b, err := version.Parse(minVersion + "-1")
+	if err != nil {
+		return false, fmt.Errorf("min_version %q: %w", minVersion, err)
+	}
+	return version.Compare(a, b) >= 0, nil
 }
 
 // serveHTTP runs the webhook receiver until ctx is cancelled.
