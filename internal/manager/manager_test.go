@@ -20,6 +20,7 @@ import (
 
 	"github.com/peios/peipkg-manager/internal/config"
 	"github.com/peios/peipkg-manager/internal/recipe"
+	"github.com/peios/peipkg-manager/internal/watch"
 )
 
 func TestComposeVersion(t *testing.T) {
@@ -299,6 +300,73 @@ func TestLoadRecipesPicksUpAddedRecipe(t *testing.T) {
 	}
 	if len(mgr.recipes) != 1 || mgr.recipes[0].ID != "beta" {
 		t.Errorf("after removal: recipes = %v, want [beta]", mgr.recipes)
+	}
+}
+
+func TestTriggerStillValidDropsRemovedRecipes(t *testing.T) {
+	mgr := &Manager{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		recipes: []recipe.Recipe{
+			{ID: "alpha"},
+		},
+	}
+	// Trigger references "beta" which is not in the current roster.
+	trig := watch.Trigger{
+		Recipe:   recipe.Recipe{ID: "beta"},
+		Captured: "1.0.0",
+	}
+	if mgr.triggerStillValid(trig) {
+		t.Error("trigger for absent recipe should be invalid")
+	}
+}
+
+func TestTriggerStillValidEnforcesCurrentMinVersion(t *testing.T) {
+	mgr := &Manager{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		recipes: []recipe.Recipe{
+			{
+				ID: "hello",
+				Upstream: recipe.Upstream{
+					MinVersion: "2.12",
+				},
+			},
+		},
+	}
+
+	cases := []struct {
+		captured string
+		want     bool
+	}{
+		{"2.11", false},  // below current min_version
+		{"2.12", true},   // equal
+		{"2.12.5", true}, // above
+		{"3.0.0", true},  // way above
+	}
+	for _, c := range cases {
+		trig := watch.Trigger{
+			Recipe:   recipe.Recipe{ID: "hello"},
+			Captured: c.captured,
+		}
+		got := mgr.triggerStillValid(trig)
+		if got != c.want {
+			t.Errorf("captured %q: got %v, want %v", c.captured, got, c.want)
+		}
+	}
+}
+
+func TestTriggerStillValidPassesWhenNoMinVersion(t *testing.T) {
+	mgr := &Manager{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		recipes: []recipe.Recipe{
+			{ID: "x", Upstream: recipe.Upstream{}},
+		},
+	}
+	trig := watch.Trigger{
+		Recipe:   recipe.Recipe{ID: "x"},
+		Captured: "0.0.1", // anything, no floor configured
+	}
+	if !mgr.triggerStillValid(trig) {
+		t.Error("trigger should pass when recipe has no min_version")
 	}
 }
 

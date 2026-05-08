@@ -151,31 +151,6 @@ func TestPollFiltersBelowMinVersion(t *testing.T) {
 	}
 }
 
-func TestUpstreamGTE(t *testing.T) {
-	cases := []struct {
-		captured, minVersion string
-		want                 bool
-	}{
-		{"2.12.2", "2.12", true},
-		{"2.12", "2.12", true},
-		{"2.11", "2.12", false},
-		{"2.0", "1.99", true},
-		{"1.0.0", "1.0.0", true},
-		{"1.0.1", "1.0.0", true},
-		{"0.9", "1.0", false},
-	}
-	for _, c := range cases {
-		got, err := upstreamGTE(c.captured, c.minVersion)
-		if err != nil {
-			t.Errorf("upstreamGTE(%q, %q): %v", c.captured, c.minVersion, err)
-			continue
-		}
-		if got != c.want {
-			t.Errorf("upstreamGTE(%q, %q) = %v, want %v", c.captured, c.minVersion, got, c.want)
-		}
-	}
-}
-
 func TestCompilePatternsRejectsInvalidRegex(t *testing.T) {
 	w := &Watcher{
 		Recipes: []recipe.Recipe{{

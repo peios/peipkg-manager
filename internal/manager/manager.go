@@ -37,6 +37,7 @@ import (
 	"github.com/peios/peipkg-manager/internal/config"
 	"github.com/peios/peipkg-manager/internal/publish"
 	"github.com/peios/peipkg-manager/internal/recipe"
+	pkgversion "github.com/peios/peipkg-manager/internal/version"
 	"github.com/peios/peipkg-manager/internal/watch"
 )
 
@@ -308,6 +309,55 @@ func (m *Manager) Reload() {
 	}
 }
 
+// triggerStillValid reports whether trig is still buildable under the
+// CURRENT recipe roster. The watcher filters at emit time, but a
+// recipe reload between emit and consume can invalidate a queued
+// trigger — for example, a min_version bump introduced between the
+// two events. The watcher's emit-time filter only sees triggers from
+// its own epoch, not the queue carry-over from previous epochs.
+//
+// Returns false (drop trigger) if:
+//   - The recipe is no longer in the roster (removed mid-flight).
+//   - The recipe's current MinVersion forbids the captured version.
+//
+// Returns true (proceed) if neither rules out the trigger. Comparison
+// errors fall through to true — recipe-load-time validation is the
+// right place to reject malformed min_version values; tolerance here
+// avoids silently dropping every trigger when an operator typo lands.
+func (m *Manager) triggerStillValid(trig watch.Trigger) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var current *recipe.Recipe
+	for i := range m.recipes {
+		if m.recipes[i].ID == trig.Recipe.ID {
+			current = &m.recipes[i]
+			break
+		}
+	}
+	if current == nil {
+		m.logger.Debug("trigger dropped (recipe removed from roster)",
+			"recipe", trig.Recipe.ID, "tag", trig.UpstreamTag)
+		return false
+	}
+	if current.Upstream.MinVersion == "" {
+		return true
+	}
+	ok, err := pkgversion.UpstreamGTE(trig.Captured, current.Upstream.MinVersion)
+	if err != nil {
+		m.logger.Warn("min_version recheck failed; proceeding",
+			"recipe", trig.Recipe.ID, "version", trig.Captured, "err", err)
+		return true
+	}
+	if !ok {
+		m.logger.Debug("trigger dropped (current recipe min_version forbids)",
+			"recipe", trig.Recipe.ID, "version", trig.Captured,
+			"min_version", current.Upstream.MinVersion)
+		return false
+	}
+	return true
+}
+
 // loadRecipes re-reads recipes_dir into m.recipes. Called by the
 // lifecycle goroutine inside Run after a reload signal.
 func (m *Manager) loadRecipes() error {
@@ -380,6 +430,17 @@ func (m *Manager) ensureRepoInitialised(ctx context.Context) error {
 // interval, not one per poll cycle) while still retrying on every
 // schedule tick.
 func (m *Manager) handleTrigger(ctx context.Context, trig watch.Trigger) {
+	// Defence-in-depth: re-validate the trigger against the *current*
+	// recipe roster before doing any work. The watcher filters on
+	// emit, but reload semantics mean a stale trigger (emitted under
+	// the previous epoch) might still be in the channel — we don't
+	// want a recipe.MinVersion change to be defeated by a queued
+	// trigger that predates the change. Same applies to a removed
+	// recipe: the trigger is moot. Cheap check, runs once per build.
+	if !m.triggerStillValid(trig) {
+		return
+	}
+
 	version := composeVersion(trig.Captured, trig.Recipe.Upstream.PeiosRevision)
 
 	already, err := m.alreadyPublished(trig.Recipe.ID, version)

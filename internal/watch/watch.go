@@ -196,7 +196,7 @@ func (w *Watcher) pollOnce(ctx context.Context, r recipe.Recipe) {
 		captured := m[1]
 
 		if r.Upstream.MinVersion != "" {
-			ok, err := upstreamGTE(captured, r.Upstream.MinVersion)
+			ok, err := version.UpstreamGTE(captured, r.Upstream.MinVersion)
 			if err != nil {
 				// Validation should be at recipe-load time; if it
 				// reaches here, tolerate by treating the tag as
@@ -217,24 +217,6 @@ func (w *Watcher) pollOnce(ctx context.Context, r recipe.Recipe) {
 		}
 	}
 	w.Logger.Info("poll complete", "recipe", r.ID, "tags_seen", len(tags), "matches_emitted", emitted, "skipped_below_min_version", skippedOld)
-}
-
-// upstreamGTE reports whether captured >= minVersion in the PSD-009
-// §2.2 ordering. Both inputs are upstream-only strings (no peios
-// revision); we synthesize a fake "<v>-1" suffix to satisfy the
-// version package's parser, which expects full peipkg version syntax.
-// Both sides get the same revision, so revision drops out and the
-// comparison is equivalent to comparing upstream segments alone.
-func upstreamGTE(captured, minVersion string) (bool, error) {
-	a, err := version.Parse(captured + "-1")
-	if err != nil {
-		return false, fmt.Errorf("captured version %q: %w", captured, err)
-	}
-	b, err := version.Parse(minVersion + "-1")
-	if err != nil {
-		return false, fmt.Errorf("min_version %q: %w", minVersion, err)
-	}
-	return version.Compare(a, b) >= 0, nil
 }
 
 // serveHTTP runs the webhook receiver until ctx is cancelled.
