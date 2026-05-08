@@ -93,7 +93,7 @@ func (r *Runner) Run(ctx context.Context, job Job) (*Result, error) {
 		return nil, fmt.Errorf("create %s: %w", stageDir, err)
 	}
 
-	commitTime, err := source.Fetch(ctx, job.Recipe.Upstream.Git, job.UpstreamRef, sourceDir)
+	commitTime, err := source.Fetch(ctx, job.Recipe.Upstream.Git, job.UpstreamRef, sourceDir, job.Recipe.Upstream.Submodules)
 	if err != nil {
 		_ = os.RemoveAll(stageDir)
 		return nil, fmt.Errorf("fetch source: %w", err)

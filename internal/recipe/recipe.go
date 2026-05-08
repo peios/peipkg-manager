@@ -41,10 +41,18 @@ type Recipe struct {
 // A recipe with empty Upstream.Git is loaded (peipkg-build can still
 // run against it on manual trigger) but cannot be auto-built — the
 // manager has no way to discover new versions.
+//
+// Submodules opts the recipe into recursive submodule fetching at
+// clone time. Default false (most projects don't use submodules; an
+// empty .gitmodules costs nothing). Set to true for projects that
+// vendor dependencies as git submodules — typical of GNU autotools
+// projects that pull in gnulib, or any project where the source tree
+// requires submodule contents to bootstrap or build.
 type Upstream struct {
 	Git           string `toml:"git"`
 	TagPattern    string `toml:"tag_pattern"`
 	PeiosRevision int    `toml:"peios_revision"`
+	Submodules    bool   `toml:"submodules"`
 }
 
 // HasUpstream reports whether the recipe has enough upstream config to

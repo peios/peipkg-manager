@@ -72,7 +72,7 @@ func TestFetchLocalRepo(t *testing.T) {
 	repo := makeLocalRepo(t, t.TempDir(), []string{"v1.0.0", "v2.0.0"})
 
 	dst := filepath.Join(t.TempDir(), "checkout")
-	commitTime, err := Fetch(context.Background(), repo, "v2.0.0", dst)
+	commitTime, err := Fetch(context.Background(), repo, "v2.0.0", dst, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,11 +104,11 @@ func TestFetchCommitTimeIsStable(t *testing.T) {
 	// fetches don't change it.)
 	repo := makeLocalRepo(t, t.TempDir(), []string{"v1.0.0"})
 
-	a, err := Fetch(context.Background(), repo, "v1.0.0", filepath.Join(t.TempDir(), "a"))
+	a, err := Fetch(context.Background(), repo, "v1.0.0", filepath.Join(t.TempDir(), "a"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := Fetch(context.Background(), repo, "v1.0.0", filepath.Join(t.TempDir(), "b"))
+	b, err := Fetch(context.Background(), repo, "v1.0.0", filepath.Join(t.TempDir(), "b"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,8 +121,96 @@ func TestFetchRefusesExistingDst(t *testing.T) {
 	repo := makeLocalRepo(t, t.TempDir(), []string{"v1.0.0"})
 	dst := t.TempDir() // exists
 
-	_, err := Fetch(context.Background(), repo, "v1.0.0", dst)
+	_, err := Fetch(context.Background(), repo, "v1.0.0", dst, false)
 	if err == nil {
 		t.Error("Fetch should refuse to overwrite an existing dst")
 	}
 }
+
+// TestFetchWithSubmodulesPopulatesContent builds a parent repo that
+// references a child repo as a submodule and tags v1.0.0 on the
+// parent. Fetch with submodules=true must produce a tree where the
+// submodule's working-tree content is present (not just an empty
+// directory) and where every .git directory anywhere in the tree has
+// been stripped.
+func TestFetchWithSubmodulesPopulatesContent(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	tmp := t.TempDir()
+
+	child := makeLocalRepo(t, filepath.Join(tmp, "child"), []string{"v1.0.0"})
+
+	// Parent gets a submodule pointing at child, then tags v1.0.0.
+	parentDir := filepath.Join(tmp, "parent")
+	if err := os.MkdirAll(parentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(cwd string, args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = cwd
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com",
+			// Allow file:// (or filesystem path) submodule URLs in the
+			// recent gits where security defaults block them.
+			"GIT_ALLOW_PROTOCOL=file:local",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v in %s: %v\n%s", args, cwd, err, out)
+		}
+	}
+	run(parentDir, "init", "-q", "-b", "main")
+	run(parentDir, "-c", "protocol.file.allow=always", "submodule", "add", "-q", child, "vendor")
+	run(parentDir, "commit", "-q", "-m", "add vendor submodule")
+	run(parentDir, "tag", "v1.0.0")
+
+	dst := filepath.Join(tmp, "checkout")
+	if _, err := exec.Command("git", "-c", "protocol.file.allow=always",
+		"clone", "--depth", "1", "--branch", "v1.0.0", "--single-branch", "--no-tags",
+		parentDir, dst).CombinedOutput(); err != nil {
+		t.Fatalf("pre-clone: %v", err)
+	}
+	// Fetch's own clone command does not bypass file-protocol restrictions
+	// so we test stripGitMetadata + the submodule update path on the
+	// just-cloned dst directly. (In production, git over https has no
+	// such restriction.)
+	if out, err := exec.Command("git", "-C", dst,
+		"-c", "protocol.file.allow=always",
+		"submodule", "update", "--init", "--recursive", "--depth", "1",
+	).CombinedOutput(); err != nil {
+		t.Fatalf("submodule update: %v\n%s", err, out)
+	}
+	if err := stripGitMetadata(dst); err != nil {
+		t.Fatalf("stripGitMetadata: %v", err)
+	}
+
+	// vendor/f exists with the child's tag content.
+	body, err := os.ReadFile(filepath.Join(dst, "vendor", "f"))
+	if err != nil {
+		t.Fatalf("submodule content missing: %v", err)
+	}
+	if string(body) != "v1.0.0" {
+		t.Errorf("submodule content = %q, want %q", body, "v1.0.0")
+	}
+
+	// No .git anywhere — neither at the top level nor inside the
+	// submodule worktree.
+	if err := filepath.WalkDir(dst, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Name() == ".git" {
+			return errLeakedGit{path: path}
+		}
+		return nil
+	}); err != nil {
+		t.Errorf("git metadata leaked: %v", err)
+	}
+}
+
+// errLeakedGit is a sentinel returned by the WalkDir callback when a
+// .git directory or file is found post-stripGitMetadata.
+type errLeakedGit struct{ path string }
+
+func (e errLeakedGit) Error() string { return ".git found at " + e.path }

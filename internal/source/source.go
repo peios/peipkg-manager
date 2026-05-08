@@ -78,6 +78,12 @@ func ListTags(ctx context.Context, repoURL string) ([]string, error) {
 // dst's parent must exist. The clone is shallow (depth 1) so even
 // large upstream histories transfer quickly.
 //
+// When submodules is true, every git submodule referenced by the tag
+// is also fetched (shallow, recursive). Used by recipes whose upstream
+// vendors gnulib or other dependencies as submodules; without this,
+// the build script sees empty submodule directories and bootstrap
+// fails.
+//
 // Returns the tag's committer timestamp formatted as RFC 3339 UTC
 // (`2024-03-15T10:30:00Z`). Callers use this as the build's
 // `--timestamp` so .peipkg bytes are reproducible from the same
@@ -85,9 +91,10 @@ func ListTags(ctx context.Context, repoURL string) ([]string, error) {
 // time never changes, but `time.Now()` does.
 //
 // On success, dst contains a regular working tree at the requested
-// tag with no .git/ directory: the source is presented as upstream
-// would ship it (via `git archive` or a release tarball), so build
-// scripts that copy the whole tree (`cp -a "$SOURCE_DIR/." "$DESTDIR/"`,
+// tag with no .git/ directory anywhere (top-level OR inside any
+// submodule): the source is presented as upstream would ship it
+// (via `git archive` or a release tarball), so build scripts that
+// copy the whole tree (`cp -a "$SOURCE_DIR/." "$DESTDIR/"`,
 // `make install`, etc.) don't accidentally pull git metadata into
 // DESTDIR and trip the orphan check.
 //
@@ -96,7 +103,7 @@ func ListTags(ctx context.Context, repoURL string) ([]string, error) {
 // the upstream-supplied version string from the tag rather than
 // re-deriving it from git, but if a real recipe needs the metadata,
 // Fetch can grow a "keep .git/" option.
-func Fetch(ctx context.Context, repoURL, tag, dst string) (commitTime string, err error) {
+func Fetch(ctx context.Context, repoURL, tag, dst string, submodules bool) (commitTime string, err error) {
 	if _, err := os.Stat(dst); err == nil {
 		return "", fmt.Errorf("destination already exists: %s", dst)
 	} else if !os.IsNotExist(err) {
@@ -120,17 +127,59 @@ func Fetch(ctx context.Context, repoURL, tag, dst string) (commitTime string, er
 		return "", fmt.Errorf("git clone --branch %s %s: %w", tag, repoURL, err)
 	}
 
+	if submodules {
+		// Recurse and fetch shallow. `--recommend-shallow` would defer
+		// to per-submodule .gitmodules `shallow=true` config, but most
+		// projects don't set it; explicit `--depth 1` is the safe call.
+		sub := exec.CommandContext(ctx, "git", "-C", dst,
+			"submodule", "update", "--init", "--recursive", "--depth", "1",
+		)
+		sub.Stderr = os.Stderr
+		if err := sub.Run(); err != nil {
+			return "", fmt.Errorf("fetch submodules at %s in %s: %w", tag, repoURL, err)
+		}
+	}
+
 	// Read the committer timestamp BEFORE we strip .git/.
 	commitTime, err = readCommitTime(ctx, dst)
 	if err != nil {
 		return "", fmt.Errorf("read commit time at %s in %s: %w", tag, repoURL, err)
 	}
 
-	// Strip .git/ so the source tree is presented as a clean snapshot.
-	if err := os.RemoveAll(filepath.Join(dst, ".git")); err != nil {
-		return "", fmt.Errorf("strip .git/ from cloned source: %w", err)
+	// Strip every .git/ in the tree (top-level + per-submodule .git
+	// gitlink files + the parent's .git/modules/<name>/ data). Using
+	// find handles the recursive case cleanly; with no submodules
+	// there is only the top-level .git/ to remove.
+	if err := stripGitMetadata(dst); err != nil {
+		return "", fmt.Errorf("strip git metadata from cloned source: %w", err)
 	}
 	return commitTime, nil
+}
+
+// stripGitMetadata removes every .git directory or gitlink file under
+// root, leaving only the working-tree contents. Implements the
+// "present source as if from a release tarball" contract for both
+// plain clones and submodule-bearing clones.
+func stripGitMetadata(root string) error {
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Name() != ".git" {
+			return nil
+		}
+		// Directory or gitlink-file (in a submodule worktree, .git is
+		// a regular file pointing at gitdir:<path>); RemoveAll handles
+		// both.
+		if rmErr := os.RemoveAll(path); rmErr != nil {
+			return rmErr
+		}
+		// If we just removed a directory, don't descend into it.
+		if d.IsDir() {
+			return filepath.SkipDir
+		}
+		return nil
+	})
 }
 
 // readCommitTime returns the committer timestamp of HEAD in workTree,
