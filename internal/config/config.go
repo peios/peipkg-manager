@@ -15,12 +15,40 @@ import (
 
 // Config is the parsed peipkg-config.toml.
 type Config struct {
-	Manager Manager `toml:"manager"`
-	Repo    Repo    `toml:"repo"`
-	Signing Signing `toml:"signing"`
-	Upload  Upload  `toml:"upload"`
-	HTTP    HTTP    `toml:"http"`
-	Poll    Poll    `toml:"poll"`
+	Manager     Manager      `toml:"manager"`
+	Repo        Repo         `toml:"repo"`
+	Signing     Signing      `toml:"signing"`
+	Upload      Upload       `toml:"upload"`
+	HTTP        HTTP         `toml:"http"`
+	Poll        Poll         `toml:"poll"`
+	SigningKeys []SigningKey `toml:"signing_key"`
+	Grants      []Grant      `toml:"grant"`
+}
+
+// SigningKey is a binary-signing key the farm holds — the .peios.sig / PIP
+// keys (e.g. the TCB key), distinct from [signing].key_file which signs the
+// .peipkg package. Recipes reference it by Name via a [[grant]]; the key
+// material stays here, off the (public) recipes repo.
+type SigningKey struct {
+	Name string `toml:"name"`
+	// Private is the path to the Ed25519 private key (PEM or 32-byte raw
+	// seed). Passed to peipkg-build for signing; never copied into a recipe.
+	Private string `toml:"private"`
+	// PubkeyEnv is the build-env variable name under which this key's public
+	// hex is injected for inject_pubkey grants (e.g. PKM_KACS_TCB_PUBKEY_HEX).
+	// Required only if the key is used in an inject_pubkey grant.
+	PubkeyEnv string `toml:"pubkey_env"`
+}
+
+// Grant authorizes one recipe (by directory ID) to use named signing keys.
+// InjectPubkey lists keys whose public hex is injected into the build env
+// (the kernel's catalogue pubkey); Sign lists keys the recipe may embed
+// .peios.sig signatures with (TCB daemons). Recipes are public, so this
+// farm-side map — not the recipe — is the authorization boundary.
+type Grant struct {
+	Recipe       string   `toml:"recipe"`
+	InjectPubkey []string `toml:"inject_pubkey"`
+	Sign         []string `toml:"sign"`
 }
 
 // Manager carries identity and on-disk paths.
@@ -135,6 +163,45 @@ func (c Config) Validate() error {
 
 	if c.Poll.DefaultInterval.Duration < time.Minute {
 		return fmt.Errorf("[poll].default_interval %v is less than the 1-minute minimum (use 1m or greater)", c.Poll.DefaultInterval.Duration)
+	}
+
+	keys := make(map[string]SigningKey, len(c.SigningKeys))
+	for i, k := range c.SigningKeys {
+		if k.Name == "" {
+			return fmt.Errorf("[[signing_key]] #%d: name is required", i)
+		}
+		if _, dup := keys[k.Name]; dup {
+			return fmt.Errorf("[[signing_key]] %s: duplicate name", k.Name)
+		}
+		if k.Private == "" {
+			return fmt.Errorf("[[signing_key]] %s: private is required", k.Name)
+		}
+		keys[k.Name] = k
+	}
+
+	grantRecipes := make(map[string]bool, len(c.Grants))
+	for i, g := range c.Grants {
+		if g.Recipe == "" {
+			return fmt.Errorf("[[grant]] #%d: recipe is required", i)
+		}
+		if grantRecipes[g.Recipe] {
+			return fmt.Errorf("[[grant]] %s: duplicate recipe", g.Recipe)
+		}
+		grantRecipes[g.Recipe] = true
+		for _, name := range g.InjectPubkey {
+			k, ok := keys[name]
+			if !ok {
+				return fmt.Errorf("[[grant]] %s: inject_pubkey references unknown signing key %q", g.Recipe, name)
+			}
+			if k.PubkeyEnv == "" {
+				return fmt.Errorf("[[grant]] %s: inject_pubkey key %q has no pubkey_env", g.Recipe, name)
+			}
+		}
+		for _, name := range g.Sign {
+			if _, ok := keys[name]; !ok {
+				return fmt.Errorf("[[grant]] %s: sign references unknown signing key %q", g.Recipe, name)
+			}
+		}
 	}
 
 	return nil

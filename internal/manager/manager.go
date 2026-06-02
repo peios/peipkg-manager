@@ -23,7 +23,11 @@ package manager
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -166,11 +170,18 @@ func New(cfg config.Config, opts Options) (*Manager, error) {
 		}
 	}
 
+	signingKeys, grants, err := resolveSigningKeys(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	repoDir := filepath.Join(cfg.Manager.StateDir, "repo")
 	runner := &build.Runner{
 		PeipkgBuildPath: peipkgBuild,
 		SourcesBaseDir:  filepath.Join(cfg.Manager.StateDir, "sources"),
 		StageBaseDir:    filepath.Join(cfg.Manager.StateDir, "stage"),
+		SigningKeys:     signingKeys,
+		Grants:          grants,
 	}
 	publisher := &publish.Publisher{
 		PeipkgRepoPath: peipkgRepo,
@@ -753,4 +764,59 @@ func clearDir(dir string) error {
 		}
 	}
 	return nil
+}
+
+// resolveSigningKeys turns the config's binary-signing keys and grants into the
+// build.Runner's maps, deriving each injectable key's public hex from its
+// private key file so the catalogue pubkey cannot drift from the key the farm
+// signs with. Keys with no pubkey_env are sign-only and need no hex.
+func resolveSigningKeys(cfg config.Config) (map[string]build.SigningKey, map[string]build.Grant, error) {
+	keys := make(map[string]build.SigningKey, len(cfg.SigningKeys))
+	for _, k := range cfg.SigningKeys {
+		sk := build.SigningKey{PrivatePath: k.Private, PubkeyEnv: k.PubkeyEnv}
+		if k.PubkeyEnv != "" {
+			h, err := pubkeyHexFromKeyFile(k.Private)
+			if err != nil {
+				return nil, nil, fmt.Errorf("signing key %q: %w", k.Name, err)
+			}
+			sk.PubkeyHex = h
+		}
+		keys[k.Name] = sk
+	}
+	grants := make(map[string]build.Grant, len(cfg.Grants))
+	for _, g := range cfg.Grants {
+		grants[g.Recipe] = build.Grant{InjectPubkey: g.InjectPubkey, Sign: g.Sign}
+	}
+	return keys, grants, nil
+}
+
+// pubkeyHexFromKeyFile loads an Ed25519 private key (PKCS#8 PEM or 32-byte raw
+// seed — the forms peipkg-build's signature loader accepts) and returns its raw
+// 32-byte public key as lowercase hex, the form the kernel signing-key
+// catalogue (generate-kacs-builtin-signing-keys.py) consumes.
+func pubkeyHexFromKeyFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read key %s: %w", path, err)
+	}
+	var priv ed25519.PrivateKey
+	if len(data) == ed25519.SeedSize {
+		priv = ed25519.NewKeyFromSeed(data)
+	} else {
+		block, _ := pem.Decode(data)
+		if block == nil {
+			return "", fmt.Errorf("key %s is neither a %d-byte seed nor a PEM block", path, ed25519.SeedSize)
+		}
+		parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			return "", fmt.Errorf("parse %s: %w", path, err)
+		}
+		edk, ok := parsed.(ed25519.PrivateKey)
+		if !ok {
+			return "", fmt.Errorf("key %s is %T, not ed25519", path, parsed)
+		}
+		priv = edk
+	}
+	pub := priv.Public().(ed25519.PublicKey)
+	return hex.EncodeToString(pub), nil
 }

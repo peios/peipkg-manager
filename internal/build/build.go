@@ -63,6 +63,31 @@ type Runner struct {
 	// runner creates a subdirectory per Run; the caller is responsible
 	// for moving the outputs out and removing the stage dir when done.
 	StageBaseDir string
+
+	// SigningKeys maps a binary-signing key name to its resolved material.
+	// Populated from config by the manager at startup.
+	SigningKeys map[string]SigningKey
+
+	// Grants maps a recipe ID to its binary-signing grant: which keys it may
+	// inject the pubkey of, and which it may sign with. A recipe with no
+	// grant gets neither — the fail-closed default.
+	Grants map[string]Grant
+}
+
+// SigningKey is a binary-signing key the farm may use on a build, resolved
+// from config. PubkeyHex/PubkeyEnv drive --build-env pubkey injection;
+// PrivatePath is handed to peipkg-build for --binary-sign-key.
+type SigningKey struct {
+	PrivatePath string
+	PubkeyHex   string
+	PubkeyEnv   string
+}
+
+// Grant authorizes a recipe to inject the public keys of, and sign with,
+// named signing keys.
+type Grant struct {
+	InjectPubkey []string
+	Sign         []string
 }
 
 // Run executes one build. On success it returns the produced .peipkg
@@ -114,6 +139,13 @@ func (r *Runner) Run(ctx context.Context, job Job) (*Result, error) {
 		args = append(args, "--sign-key", job.SignKeyPath)
 	}
 
+	signArgs, err := r.binarySigningArgs(job.Recipe.ID)
+	if err != nil {
+		_ = os.RemoveAll(stageDir)
+		return nil, err
+	}
+	args = append(args, signArgs...)
+
 	cmd := exec.CommandContext(ctx, r.PeipkgBuildPath, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -130,6 +162,37 @@ func (r *Runner) Run(ctx context.Context, job Job) (*Result, error) {
 		return nil, fmt.Errorf("peipkg-build succeeded but produced no .peipkg files in %s", stageDir)
 	}
 	return &Result{Outputs: outputs, Timestamp: commitTime}, nil
+}
+
+// binarySigningArgs resolves a recipe's grant into peipkg-build flags:
+// --build-env <PubkeyEnv>=<hex> for each inject_pubkey key (e.g. the kernel's
+// catalogue pubkey) and --binary-sign-key <name>=<path> for each sign key
+// (e.g. TCB daemons). A recipe with no grant gets no extra flags — the
+// fail-closed default: a recipe can't sign or inject a key it wasn't granted.
+func (r *Runner) binarySigningArgs(recipeID string) ([]string, error) {
+	grant, ok := r.Grants[recipeID]
+	if !ok {
+		return nil, nil
+	}
+	var args []string
+	for _, name := range grant.InjectPubkey {
+		key, ok := r.SigningKeys[name]
+		if !ok {
+			return nil, fmt.Errorf("recipe %q grant: unknown signing key %q", recipeID, name)
+		}
+		if key.PubkeyEnv == "" || key.PubkeyHex == "" {
+			return nil, fmt.Errorf("recipe %q grant: signing key %q has no pubkey for injection", recipeID, name)
+		}
+		args = append(args, "--build-env", key.PubkeyEnv+"="+key.PubkeyHex)
+	}
+	for _, name := range grant.Sign {
+		key, ok := r.SigningKeys[name]
+		if !ok {
+			return nil, fmt.Errorf("recipe %q grant: unknown signing key %q", recipeID, name)
+		}
+		args = append(args, "--binary-sign-key", name+"="+key.PrivatePath)
+	}
+	return args, nil
 }
 
 func collectOutputs(stageDir string) ([]string, error) {
