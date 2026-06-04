@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,6 +149,137 @@ func TestPollFiltersBelowMinVersion(t *testing.T) {
 	}
 	if !got["v2.1.0"] {
 		t.Error("v2.1.0 should have passed (> min_version 2.0.0)")
+	}
+}
+
+func TestPollNamedGroupsComposeVersion(t *testing.T) {
+	// busybox-style underscore-separated tag — captured groups get
+	// composed into a PSD-009-conformant dotted version.
+	repo := makeLocalRepo(t, t.TempDir(), []string{"1_31_0", "1_36_1", "release-old"})
+
+	r := recipe.Recipe{
+		ID:   "busybox",
+		Path: "/dev/null",
+		Upstream: recipe.Upstream{
+			Git:           repo,
+			TagPattern:    `^(?P<major>\d+)_(?P<minor>\d+)_(?P<patch>\d+)$`,
+			PeiosRevision: 1,
+		},
+	}
+
+	triggers := make(chan Trigger, 16)
+	w := &Watcher{
+		Recipes:     []recipe.Recipe{r},
+		DefaultPoll: time.Hour,
+		Logger:      discardLogger(),
+		Triggers:    triggers,
+	}
+	if err := w.compilePatterns(); err != nil {
+		t.Fatal(err)
+	}
+
+	w.pollOnce(context.Background(), r)
+	close(triggers)
+
+	got := map[string]string{}
+	for trig := range triggers {
+		got[trig.UpstreamTag] = trig.Captured
+	}
+	want := map[string]string{
+		"1_31_0": "1.31.0",
+		"1_36_1": "1.36.1",
+	}
+	for tag, captured := range want {
+		if got[tag] != captured {
+			t.Errorf("tag %q: captured = %q, want %q", tag, got[tag], captured)
+		}
+	}
+	if _, ok := got["release-old"]; ok {
+		t.Error("non-matching tag was emitted: release-old")
+	}
+}
+
+func TestPollNamedGroupsComposeWithPrerelease(t *testing.T) {
+	// Pkm-style prerelease tag — major/minor/patch + optional prerelease
+	// compose to PSD-009 syntax.
+	repo := makeLocalRepo(t, t.TempDir(), []string{"v0.20.0-alpha1", "v0.20.0", "v0.20.0-rc1"})
+
+	r := recipe.Recipe{
+		ID:   "pkm",
+		Path: "/dev/null",
+		Upstream: recipe.Upstream{
+			Git:           repo,
+			TagPattern:    `^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)(?:-(?P<prerelease>[a-z]+\d+))?$`,
+			PeiosRevision: 1,
+		},
+	}
+
+	triggers := make(chan Trigger, 16)
+	w := &Watcher{
+		Recipes:     []recipe.Recipe{r},
+		DefaultPoll: time.Hour,
+		Logger:      discardLogger(),
+		Triggers:    triggers,
+	}
+	if err := w.compilePatterns(); err != nil {
+		t.Fatal(err)
+	}
+
+	w.pollOnce(context.Background(), r)
+	close(triggers)
+
+	got := map[string]string{}
+	for trig := range triggers {
+		got[trig.UpstreamTag] = trig.Captured
+	}
+	want := map[string]string{
+		"v0.20.0-alpha1": "0.20.0-alpha1",
+		"v0.20.0":        "0.20.0",
+		"v0.20.0-rc1":    "0.20.0-rc1",
+	}
+	for tag, captured := range want {
+		if got[tag] != captured {
+			t.Errorf("tag %q: captured = %q, want %q", tag, got[tag], captured)
+		}
+	}
+}
+
+func TestCompilePatternsRejectsUnknownNamedGroup(t *testing.T) {
+	w := &Watcher{
+		Recipes: []recipe.Recipe{{
+			ID: "bad", Path: "x",
+			Upstream: recipe.Upstream{Git: "x", TagPattern: `^(?P<flavor>\w+)_(?P<major>\d+)\.(?P<minor>\d+)$`},
+		}},
+	}
+	err := w.compilePatterns()
+	if err == nil || !strings.Contains(err.Error(), "unknown named group") {
+		t.Errorf("expected unknown-named-group rejection, got: %v", err)
+	}
+}
+
+func TestCompilePatternsRequiresMajorMinor(t *testing.T) {
+	w := &Watcher{
+		Recipes: []recipe.Recipe{{
+			ID: "bad", Path: "x",
+			Upstream: recipe.Upstream{Git: "x", TagPattern: `^(?P<major>\d+)$`},
+		}},
+	}
+	err := w.compilePatterns()
+	if err == nil || !strings.Contains(err.Error(), "requires both 'major' and 'minor'") {
+		t.Errorf("expected major+minor required, got: %v", err)
+	}
+}
+
+func TestCompilePatternsRejectsMixedNamedAndUnnamed(t *testing.T) {
+	w := &Watcher{
+		Recipes: []recipe.Recipe{{
+			ID: "bad", Path: "x",
+			Upstream: recipe.Upstream{Git: "x", TagPattern: `^(?P<major>\d+)_(?P<minor>\d+)_(\d+)$`},
+		}},
+	}
+	err := w.compilePatterns()
+	if err == nil || !strings.Contains(err.Error(), "mixes named and unnamed") {
+		t.Errorf("expected mixed-style rejection, got: %v", err)
 	}
 }
 

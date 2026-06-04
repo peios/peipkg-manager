@@ -140,6 +140,22 @@ func (w *Watcher) RunOnce(ctx context.Context) error {
 // compilePatterns precompiles every recipe's tag_pattern and builds the
 // recipesByGit lookup. Done once at Run startup so per-poll work is
 // cheap.
+//
+// Two tag_pattern styles are supported:
+//
+//   - **Unnamed-capture** (legacy / single-segment versions): the first
+//     capture group becomes the upstream version verbatim. Used when the
+//     upstream tag already matches PSD-009 syntax — e.g., figlet's
+//     `^([0-9]+\.[0-9]+\.[0-9]+)$` capturing `2.2.5`.
+//
+//   - **Named-capture**: the pattern uses Go's `(?P<name>...)` syntax
+//     with the well-known names `major`, `minor`, `patch`, `prerelease`.
+//     The manager composes the upstream version as
+//     `<major>.<minor>[.<patch>][-<prerelease>]`. Used when upstream tag
+//     syntax doesn't match PSD-009 (e.g., busybox's `1_31_0` → `1.31.0`).
+//
+// A recipe MUST use exactly one style. Mixing named and unnamed groups
+// in the same pattern is rejected at compile time.
 func (w *Watcher) compilePatterns() error {
 	w.patterns = make(map[string]*regexp.Regexp, len(w.Recipes))
 	w.recipesByGit = make(map[string]recipe.Recipe, len(w.Recipes))
@@ -155,10 +171,108 @@ func (w *Watcher) compilePatterns() error {
 		if re.NumSubexp() < 1 {
 			return fmt.Errorf("recipe %s: tag_pattern %q must have at least one capture group (the version string)", r.ID, r.Upstream.TagPattern)
 		}
+		if err := validateNamedGroups(r.ID, re); err != nil {
+			return err
+		}
 		w.patterns[r.ID] = re
 		w.recipesByGit[normalizeGitURL(r.Upstream.Git)] = r
 	}
 	return nil
+}
+
+// versionGroupNames is the closed vocabulary of named capture groups
+// recognised in tag_pattern. Manager owns version composition; recipes
+// pick which parts they want to capture from the upstream tag.
+//
+// `major` and `minor` are required when any named group is used.
+// `patch` and `prerelease` are optional. Any other named group is
+// rejected at recipe-load time so typos surface immediately.
+var versionGroupNames = map[string]bool{
+	"major":      true,
+	"minor":      true,
+	"patch":      true,
+	"prerelease": true,
+}
+
+// validateNamedGroups enforces the named-capture vocabulary. If the
+// pattern has no named groups it falls back to the unnamed-capture
+// style and validation is a no-op.
+func validateNamedGroups(recipeID string, re *regexp.Regexp) error {
+	names := re.SubexpNames() // index 0 is "" (whole match)
+	hasNamed := false
+	for i := 1; i < len(names); i++ {
+		if names[i] != "" {
+			hasNamed = true
+			break
+		}
+	}
+	if !hasNamed {
+		return nil
+	}
+	seen := map[string]bool{}
+	hasUnnamedAfterFirst := false
+	for i := 1; i < len(names); i++ {
+		n := names[i]
+		if n == "" {
+			hasUnnamedAfterFirst = true
+			continue
+		}
+		if !versionGroupNames[n] {
+			return fmt.Errorf("recipe %s: tag_pattern uses unknown named group %q (allowed: major, minor, patch, prerelease)", recipeID, n)
+		}
+		if seen[n] {
+			return fmt.Errorf("recipe %s: tag_pattern repeats named group %q", recipeID, n)
+		}
+		seen[n] = true
+	}
+	if hasUnnamedAfterFirst {
+		return fmt.Errorf("recipe %s: tag_pattern mixes named and unnamed capture groups — use one style", recipeID)
+	}
+	if !seen["major"] || !seen["minor"] {
+		return fmt.Errorf("recipe %s: tag_pattern with named groups requires both 'major' and 'minor' (got %v)", recipeID, mapKeys(seen))
+	}
+	return nil
+}
+
+// mapKeys returns sorted keys for stable error messages.
+func mapKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	// Small list; insertion-sort for determinism without importing sort.
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j-1] > out[j]; j-- {
+			out[j-1], out[j] = out[j], out[j-1]
+		}
+	}
+	return out
+}
+
+// composeVersion returns the upstream version derived from a tag match.
+// For named-capture patterns it composes <major>.<minor>[.<patch>][-<prerelease>].
+// For unnamed-capture patterns it returns the first capture group as-is.
+func composeVersion(re *regexp.Regexp, match []string) string {
+	names := re.SubexpNames()
+	parts := map[string]string{}
+	hasNamed := false
+	for i := 1; i < len(names) && i < len(match); i++ {
+		if names[i] != "" {
+			parts[names[i]] = match[i]
+			hasNamed = true
+		}
+	}
+	if !hasNamed {
+		return match[1]
+	}
+	v := parts["major"] + "." + parts["minor"]
+	if patch, ok := parts["patch"]; ok && patch != "" {
+		v += "." + patch
+	}
+	if pre, ok := parts["prerelease"]; ok && pre != "" {
+		v += "-" + pre
+	}
+	return v
 }
 
 func (w *Watcher) pollLoop(ctx context.Context, r recipe.Recipe, interval time.Duration) {
@@ -193,7 +307,7 @@ func (w *Watcher) pollOnce(ctx context.Context, r recipe.Recipe) {
 		if len(m) < 2 {
 			continue
 		}
-		captured := m[1]
+		captured := composeVersion(re, m)
 
 		if r.Upstream.MinVersion != "" {
 			ok, err := version.UpstreamGTE(captured, r.Upstream.MinVersion)
